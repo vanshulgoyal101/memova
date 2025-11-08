@@ -1,0 +1,28 @@
+# Core dependencies
+pandas==2.1.4
+openpyxl==3.1.2
+Faker==22.0.0
+sqlalchemy==2.0.25
+
+# AI/ML
+google-generativeai>=0.3.0
+
+# API Framework
+fastapi>=0.109.0
+uvicorn>=0.27.0
+pydantic>=2.5.0
+python-multipart>=0.0.6  # Required for file uploads
+
+# Configuration
+python-dotenv>=1.0.0
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# Type checking (optional)
+mypy>=1.7.0
+
+# Groq AI (requires httpx<0.28 for compatibility)
+groq==0.11.0
+httpx<0.28  # Required for groq SDK compatibility

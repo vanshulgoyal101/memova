@@ -1,0 +1,65 @@
+# Vercel ignore patterns
+# Exclude these from deployment to reduce bundle size
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+env/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Test files
+tests/
+pytest.ini
+.pytest_cache/
+
+# Documentation (optional - keep if you want docs accessible)
+# docs/
+
+# Scripts (not needed in production)
+scripts/
+
+# Excel source files (we only need the .db files)
+data/excel/
+
+# User uploads directory
+data/user_uploads/
+
+# Backup files
+*.bak
+
+# Development files
+test_*.py
+demo.py
+query.py
+query_multi.py
+generate.py
+start_web.sh
+Makefile
+
+# Git
+.git/
+.gitignore
+
+# Environment files (secrets should be in Vercel env vars)
+.env
+.env.*
+!.env.example

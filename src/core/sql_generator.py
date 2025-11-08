@@ -1,0 +1,742 @@
+"""
+SQL query generator with prompt engineering
+Converts natural language to SQLite queries using Groq (primary) with Gemini fallback
+Supports both single SQL queries and multi-query execution plans
+"""
+
+import time
+import json
+from typing import Dict, Any, Optional
+
+from src.core.llm_client import UnifiedLLMClient
+from src.core.api_key_manager import APIKeyManager
+from src.core.query_plan import QueryPlan, QueryStep
+from src.utils.config import Config
+from src.utils.logger import setup_logger
+from src.utils.exceptions import QueryError
+
+logger = setup_logger(__name__)
+
+
+class SQLGenerator:
+    """
+    Natural language to SQL query generator
+    
+    Features:
+    - Optimized prompt engineering for SQLite
+    - Automatic SQL cleaning and validation
+    - Retry logic with API key rotation
+    
+    Example:
+        >>> generator = SQLGenerator(schema_text="CREATE TABLE users...")
+        >>> sql = generator.generate("How many users are there?")
+        >>> print(sql)
+        SELECT COUNT(*) FROM users
+    """
+    
+    def __init__(
+        self,
+        schema_text: str,
+        llm_client: UnifiedLLMClient,
+        api_key_manager: APIKeyManager
+    ):
+        """
+        Initialize SQL generator
+        
+        Args:
+            schema_text: Database schema formatted for prompt context
+            llm_client: Configured UnifiedLLMClient instance (Groq + Gemini)
+            api_key_manager: APIKeyManager for Gemini rotation on rate limits
+        """
+        self.schema_text = schema_text
+        self.llm_client = llm_client
+        self.api_key_manager = api_key_manager
+    
+    def generate(self, question: str) -> str:
+        """
+        Generate SQL query from natural language question
+        
+        Uses UnifiedLLMClient which automatically tries Groq first,
+        then falls back to Gemini on any error.
+        
+        Args:
+            question: Natural language question
+            
+        Returns:
+            SQL query string
+            
+        Raises:
+            QueryError: If query generation fails or question is empty
+            
+        Example:
+            >>> sql = generator.generate("Show me top 5 products by revenue")
+            >>> print(sql)
+            SELECT product_name, SUM(revenue) as total_revenue 
+            FROM sales 
+            GROUP BY product_name 
+            ORDER BY total_revenue DESC 
+            LIMIT 5
+        """
+        logger.info(f"Generating SQL for: {question}")
+        
+        if not question or not question.strip():
+            raise QueryError("Question cannot be empty")
+        
+        # Pre-validate: Check if question keywords match available tables
+        question_lower = question.lower()
+        
+        # Extract table names from schema
+        schema_tables = []
+        for line in self.schema_text.split('\n'):
+            if line.startswith('Table: '):
+                table_name = line.replace('Table: ', '').strip()
+                schema_tables.append(table_name.lower())
+        
+        # Check for common mismatches
+        mismatch_keywords = {
+            'student': ['students', 'enrollment', 'learner'],
+            'class': ['classes', 'course', 'grade'],
+            'question': ['questions', 'quiz', 'test', 'exam', 'assessment'],
+            'teacher': ['teachers', 'instructor', 'faculty'],
+            'score': ['scores', 'marks', 'grades', 'results'],
+        }
+        
+        # Detect if question asks about concepts not in schema
+        for keyword, related_terms in mismatch_keywords.items():
+            if keyword in question_lower or any(term in question_lower for term in related_terms):
+                # Check if ANY related table exists
+                has_related_table = any(
+                    any(term in table for term in related_terms + [keyword])
+                    for table in schema_tables
+                )
+                
+                if not has_related_table:
+                    available_tables_str = ", ".join(schema_tables)
+                    raise QueryError(
+                        f"This database does not contain data about '{keyword}'. "
+                        f"Available tables: {available_tables_str}. "
+                        f"Tip: Switch to the correct database that matches your question."
+                    )
+        
+        try:
+            system_message, user_message = self._create_prompt(question)
+            
+            start_time = time.time()
+            
+            # Use unified client (tries Groq first with caching, falls back to Gemini)
+            # System message (schema) is static and will be cached by Groq
+            sql_text, provider = self.llm_client.generate_content(
+                user_message, 
+                system_message=system_message
+            )
+            
+            generation_time = time.time() - start_time
+            logger.info(f"SQL generated by {provider.upper()} in {generation_time:.2f}s")
+            
+            # Check if LLM returned an error about domain mismatch
+            if sql_text.strip().startswith("ERROR:"):
+                logger.warning(f"Domain mismatch detected: {sql_text}")
+                raise QueryError(sql_text.replace("ERROR:", "").strip())
+            
+            sql = self._clean_sql(sql_text)
+            logger.info(f"Generated SQL: {sql[:100]}...")
+            
+            return sql
+            
+        except Exception as e:
+            logger.error(f"SQL generation failed: {e}")
+            raise QueryError(f"Failed to generate SQL: {e}")
+    
+    def _create_prompt(self, question: str) -> tuple[str, str]:
+        """
+        Create optimized prompt for SQL generation with caching support
+        
+        Returns schema as system message (static, cacheable) and 
+        question as user message (dynamic) separately.
+        
+        Args:
+            question: Natural language question
+            
+        Returns:
+            Tuple of (system_message, user_message) for optimal caching
+        """
+        # System message: Static schema + instructions (CACHED by Groq)
+        system_message = f"""{self.schema_text}
+
+INSTRUCTIONS:
+You are an expert SQL query generator for SQLite databases.
+
+RULES:
+1. Generate ONLY valid SQLite SQL queries
+2. Return ONLY the SQL query with no explanations, markdown, or code blocks
+3. Use proper JOIN syntax when querying multiple tables
+4. Include appropriate WHERE, GROUP BY, HAVING, ORDER BY clauses
+5. Use aggregate functions (COUNT, SUM, AVG, MAX, MIN) when appropriate
+6. Add a reasonable LIMIT clause if the user hasn't requested a specific limit (server enforces maximum)
+7. Use table aliases for better readability
+8. Handle NULL values appropriately
+9. Use LIKE with wildcards for text searches
+10. Generate efficient queries with proper indexing considerations
+
+CRITICAL - ALWAYS INCLUDE METRICS:
+11. When asked about "top N" or "best" or "selling" items, ALWAYS include the metric being used for ranking
+12. For sales questions: Include actual sales amounts (quantity, revenue, total_price)
+13. For top products: SELECT product_name, SUM(metric) as total_metric, NOT just product_name alone
+14. Make results useful - users need the numbers that justify the ranking
+15. Examples:
+    - "top 5 products" → SELECT product_name, SUM(quantity) as units_sold FROM...
+    - "best customers" → SELECT customer_name, SUM(total_price) as total_spent FROM...
+    - "highest revenue" → SELECT product_name, SUM(revenue) as total_revenue FROM...
+
+CRITICAL - DOMAIN MATCHING:
+16. ONLY use tables and columns that exist in the schema above
+17. DO NOT invent or assume column names (e.g., don't use "difficulty" if it doesn't exist)
+18. DO NOT reinterpret the question to fit unrelated data (e.g., don't treat "questions" as "tickets")
+19. If the question asks for data that doesn't exist in this schema, return: ERROR: This database does not contain the requested data. Available tables: [list tables]
+20. Be literal - if asked about "students" and there's no students table, return an error instead of guessing"""
+        
+        # User message: Dynamic question only (NOT cached)
+        user_message = f"""QUESTION: {question}
+
+SQL QUERY:"""
+        
+        return system_message, user_message
+    
+    def fix_sql_error(
+        self, 
+        failing_sql: str, 
+        error_message: str,
+        question: str,
+        attempt: int = 1
+    ) -> str:
+        """
+        Use AI to fix SQL query that caused a database error
+        
+        Sends the failing SQL, error message, and schema context back to the LLM
+        to generate a corrected version.
+        
+        Args:
+            failing_sql: The SQL query that failed
+            error_message: The database error message
+            question: Original user question for context
+            attempt: Retry attempt number (for logging)
+            
+        Returns:
+            Corrected SQL query string
+            
+        Raises:
+            QueryError: If correction fails
+            
+        Example:
+            >>> corrected = generator.fix_sql_error(
+            ...     "SELECT product_id FROM sales JOIN products",
+            ...     "ambiguous column name: product_id",
+            ...     "Show products with sales"
+            ... )
+            >>> # Returns: "SELECT p.product_id FROM sales s JOIN products p ON s.product_id = p.product_id"
+        """
+        logger.warning(f"Attempting to fix SQL error (attempt {attempt}): {error_message}")
+        
+        try:
+            # System message: Schema + error correction instructions
+            system_message = f"""{self.schema_text}
+
+INSTRUCTIONS:
+You are an expert SQL debugger for SQLite databases.
+
+Your task is to FIX a SQL query that caused a database error.
+
+RULES:
+1. Analyze the error message carefully
+2. Generate a CORRECTED SQL query that resolves the error
+3. Return ONLY the corrected SQL query with no explanations
+4. Common fixes:
+   - Ambiguous columns: Use table aliases (e.g., p.product_id, s.product_id)
+   - Missing JOIN conditions: Add proper ON clauses
+   - Invalid syntax: Fix SQLite syntax errors
+   - Column not found: Check column names in schema
+   - Type mismatches: Use proper CAST operations
+   - Multiple statements: Return ONLY ONE SELECT query (no semicolons)
+5. Maintain the original query's intent while fixing the error
+6. Use proper JOIN syntax and table aliases consistently
+7. CRITICAL: Return only a SINGLE SQL statement (no semicolons, no multiple queries)"""
+            
+            # User message: The error context
+            user_message = f"""ORIGINAL QUESTION: {question}
+
+FAILING SQL QUERY:
+{failing_sql}
+
+DATABASE ERROR:
+{error_message}
+
+CORRECTED SQL QUERY:"""
+            
+            start_time = time.time()
+            
+            # Use unified client for correction (Groq primary, Gemini fallback)
+            sql_text, provider = self.llm_client.generate_content(
+                user_message, 
+                system_message=system_message
+            )
+            
+            correction_time = time.time() - start_time
+            logger.info(f"SQL correction generated by {provider.upper()} in {correction_time:.2f}s")
+            
+            corrected_sql = self._clean_sql(sql_text)
+            logger.info(f"Corrected SQL: {corrected_sql[:100]}...")
+            
+            return corrected_sql
+            
+        except Exception as e:
+            logger.error(f"SQL error correction failed: {e}")
+            raise QueryError(f"Failed to correct SQL: {e}")
+    
+    def _clean_sql(self, sql: str) -> str:
+        """
+        Clean and validate generated SQL
+        
+        Removes markdown code blocks, common AI-generated prefixes,
+        and normalizes whitespace.
+        
+        Args:
+            sql: Raw SQL from LLM
+            
+        Returns:
+            Cleaned SQL string
+        """
+        original_sql = sql
+        
+        # Remove markdown code blocks
+        sql = sql.replace('```sql', '').replace('```', '').strip()
+        
+        # Remove common prefixes that AI might add (case-insensitive check)
+        prefixes_to_remove = [
+            'SQLite ',
+            'SQL ',
+            'Query: ',
+            'sqlite ',
+            'sql '
+        ]
+        
+        for prefix in prefixes_to_remove:
+            if sql.lower().startswith(prefix.lower()):
+                sql = sql[len(prefix):].strip()
+                logger.debug(f"Removed prefix '{prefix}' from SQL")
+                break  # Only remove first matching prefix
+        
+        # If AI generated multiple statements separated by semicolons, take only the first
+        if ';' in sql:
+            statements = [s.strip() for s in sql.split(';') if s.strip()]
+            if len(statements) > 1:
+                logger.warning(f"AI generated {len(statements)} statements, using only the first")
+                logger.debug(f"Discarded statements: {statements[1:]}")
+            sql = statements[0] if statements else sql
+        
+        # If still starts with word before SELECT, find SELECT and start from there
+        if not sql.upper().startswith('SELECT'):
+            select_idx = sql.upper().find('SELECT')
+            if select_idx > 0:
+                logger.debug(f"Found SELECT at position {select_idx}, trimming prefix")
+                sql = sql[select_idx:].strip()
+        
+        # Remove trailing semicolon (if any left)
+        sql = sql.rstrip(';').strip()
+        
+        # Remove multiple whitespaces
+        sql = ' '.join(sql.split())
+        
+        # Basic validation - ensure it's a SELECT query
+        if not sql.upper().startswith('SELECT'):
+            logger.warning(f"Generated query is not a SELECT: {sql[:50]}")
+        
+        return sql
+    
+    def needs_multi_query(self, question: str) -> bool:
+        """
+        Determine if a question requires multiple queries.
+        
+        Uses simple keyword detection to identify comparative/complex questions.
+        For production, this could be enhanced with an LLM classifier.
+        
+        Args:
+            question: Natural language question
+            
+        Returns:
+            True if multi-query plan recommended, False for single query
+            
+        Example:
+            >>> generator.needs_multi_query("Compare November vs December sales")
+            True
+            >>> generator.needs_multi_query("How many employees?")
+            False
+        """
+        question_lower = question.lower()
+        
+        # Keywords that suggest comparison/multi-step queries
+        comparison_keywords = [
+            'compare', 'comparison', 'vs', 'versus', 'difference between',
+            'both', 'each', 'and also', 'as well as', 'in addition to'
+        ]
+        
+        # Time period comparisons
+        time_comparisons = [
+            'this month vs last month', 'this year vs last year',
+            'quarter over quarter', 'year over year',
+            'monthly comparison', 'annual comparison'
+        ]
+        
+        # Multi-entity queries
+        multi_entity = [
+            'top 5 and bottom 5', 'best and worst',
+            'highest and lowest', 'maximum and minimum'
+        ]
+        
+        # Check for comparison keywords
+        for keyword in comparison_keywords:
+            if keyword in question_lower:
+                return True
+        
+        # Check for time comparisons
+        for pattern in time_comparisons:
+            if pattern in question_lower:
+                return True
+        
+        # Check for multi-entity patterns
+        for pattern in multi_entity:
+            if pattern in question_lower:
+                return True
+        
+        return False
+    
+    def generate_query_plan(self, question: str) -> QueryPlan:
+        """
+        Generate a multi-query execution plan from natural language.
+        
+        Uses LLM to decompose complex questions into multiple SQL queries
+        with dependency relationships. Automatically retries on JSON parsing errors.
+        
+        Args:
+            question: Natural language question (likely comparative/complex)
+            
+        Returns:
+            QueryPlan with multiple QueryStep objects
+            
+        Raises:
+            QueryError: If plan generation or parsing fails after retries
+            
+        Example:
+            >>> plan = generator.generate_query_plan("Compare Nov vs Dec sales")
+            >>> print(len(plan.queries))
+            3  # q1: Nov sales, q2: Dec sales, q3: comparison
+        """
+        logger.info(f"Generating query plan for: {question}")
+        
+        if not question or not question.strip():
+            raise QueryError("Question cannot be empty")
+        
+        # Pre-validate: Check if question keywords match available tables
+        question_lower = question.lower()
+        
+        # Extract table names from schema
+        schema_tables = []
+        for line in self.schema_text.split('\n'):
+            if line.startswith('Table: '):
+                table_name = line.replace('Table: ', '').strip()
+                schema_tables.append(table_name.lower())
+        
+        # Check for common domain mismatches
+        mismatch_keywords = {
+            'student': ['students', 'enrollment', 'learner'],
+            'class': ['classes', 'course', 'grade'],
+            'question': ['questions', 'quiz', 'test', 'exam', 'assessment'],
+            'teacher': ['teachers', 'instructor', 'faculty'],
+            'score': ['scores', 'marks', 'grades', 'results'],
+        }
+        
+        # Detect if question asks about concepts not in schema
+        for keyword, related_terms in mismatch_keywords.items():
+            if keyword in question_lower or any(term in question_lower for term in related_terms):
+                # Check if ANY related table exists
+                has_related_table = any(
+                    any(term in table for term in related_terms + [keyword])
+                    for table in schema_tables
+                )
+                
+                if not has_related_table:
+                    available_tables_str = ", ".join(schema_tables)
+                    raise QueryError(
+                        f"This database does not contain data about '{keyword}'. "
+                        f"Available tables: {available_tables_str}. "
+                        f"Tip: Switch to the correct database that matches your question."
+                    )
+        
+        max_retries = 2
+        last_error = None
+        
+        for attempt in range(max_retries + 1):
+            try:
+                if attempt == 0:
+                    # First attempt: normal prompt
+                    prompt = self._create_plan_prompt(question)
+                else:
+                    # Retry attempt: add emphasis on JSON formatting
+                    logger.warning(f"🔄 Retrying query plan generation (attempt {attempt + 1}/{max_retries + 1}) - previous error: {last_error}")
+                    prompt = self._create_plan_prompt_with_json_emphasis(question, str(last_error))
+                
+                start_time = time.time()
+                
+                # Use unified client (tries Groq first, falls back to Gemini)
+                plan_json, provider = self.llm_client.generate_content(prompt)
+                
+                generation_time = time.time() - start_time
+                logger.info(f"Query plan generated by {provider.upper()} in {generation_time:.2f}s")
+                
+                # Parse JSON response
+                plan_dict = self._parse_plan_json(plan_json)
+                
+                # Convert to QueryPlan object
+                plan = self._build_query_plan(plan_dict, question)
+                
+                logger.info(f"Generated plan with {len(plan.queries)} queries")
+                if attempt > 0:
+                    logger.info(f"✅ Query plan succeeded after {attempt + 1} attempts")
+                return plan
+                
+            except (json.JSONDecodeError, QueryError) as e:
+                last_error = e
+                error_msg = str(e)
+                
+                # Only retry on JSON/parsing errors, not on other errors
+                if "JSON" in error_msg or "parse" in error_msg.lower():
+                    if attempt < max_retries:
+                        logger.warning(f"JSON parsing error, will retry: {error_msg[:200]}")
+                        continue
+                
+                # Non-retryable error or max retries reached
+                logger.error(f"Query plan generation failed: {e}")
+                raise QueryError(f"Failed to generate query plan: {e}")
+            
+            except Exception as e:
+                # Other unexpected errors - fail immediately
+                logger.error(f"Query plan generation failed: {e}")
+                raise QueryError(f"Failed to generate query plan: {e}")
+    
+    def _create_plan_prompt(self, question: str) -> str:
+        """
+        Create prompt for generating multi-query execution plans.
+        
+        Args:
+            question: Natural language question
+            
+        Returns:
+            Complete prompt string with schema and JSON format instructions
+        """
+        return f"""{self.schema_text}
+
+INSTRUCTIONS:
+You are an expert SQL query planner. Break down complex questions into multiple SQL queries with dependencies.
+
+TASK:
+Analyze the question and create a step-by-step query execution plan. Each step should:
+1. Have a unique ID (q1, q2, q3, ...)
+2. Have a clear description of what it does
+3. Contain a valid SQLite SQL query
+4. List which previous queries it depends on (if any)
+
+RULES:
+1. Use simple query IDs: "q1", "q2", "q3", etc.
+2. Independent queries (no dependencies) should run first
+3. Dependent queries can reference previous results using "FROM q1", "FROM q2", etc.
+4. The final query should combine/compare results to answer the question
+5. Keep queries simple and focused on one task each
+6. Use proper SQLite syntax
+7. No markdown, code blocks, or explanations - just JSON
+
+OUTPUT FORMAT (valid JSON only):
+{{
+  "queries": [
+    {{
+      "id": "q1",
+      "description": "Brief description of what this query does",
+      "sql": "SELECT ... FROM table1 WHERE ...",
+      "depends_on": []
+    }},
+    {{
+      "id": "q2",
+      "description": "Brief description",
+      "sql": "SELECT ... FROM table2 WHERE ...",
+      "depends_on": []
+    }},
+    {{
+      "id": "q3",
+      "description": "Combine results from q1 and q2",
+      "sql": "SELECT (SELECT col FROM q1) as val1, (SELECT col FROM q2) as val2",
+      "depends_on": ["q1", "q2"]
+    }}
+  ],
+  "final_query_id": "q3"
+}}
+
+QUESTION: {question}
+
+QUERY PLAN (JSON):"""
+    
+    def _create_plan_prompt_with_json_emphasis(self, question: str, previous_error: str) -> str:
+        """
+        Create retry prompt with extra emphasis on valid JSON formatting.
+        
+        Used when first attempt failed with JSON parsing error.
+        
+        Args:
+            question: Natural language question
+            previous_error: The JSON error from previous attempt
+            
+        Returns:
+            Prompt with strong JSON formatting instructions
+        """
+        return f"""{self.schema_text}
+
+INSTRUCTIONS:
+You are an expert SQL query planner. Your previous response had a JSON formatting error.
+
+PREVIOUS ERROR: {previous_error}
+
+CRITICAL: Your response MUST be valid JSON. Common mistakes to avoid:
+- Missing commas between array elements
+- Unescaped quotes in strings (use single quotes in SQL)
+- Trailing commas before closing braces
+- Comments in JSON (not allowed)
+- Extra text outside the JSON object
+
+TASK:
+Create a query execution plan for this question. Return ONLY valid JSON, nothing else.
+
+OUTPUT FORMAT (VALID JSON ONLY - NO MARKDOWN, NO EXPLANATIONS):
+{{
+  "queries": [
+    {{
+      "id": "q1",
+      "description": "Description here",
+      "sql": "SELECT col FROM table WHERE condition",
+      "depends_on": []
+    }},
+    {{
+      "id": "q2",
+      "description": "Description here",
+      "sql": "SELECT col FROM table2",
+      "depends_on": []
+    }},
+    {{
+      "id": "q3",
+      "description": "Combine q1 and q2",
+      "sql": "SELECT * FROM q1 UNION SELECT * FROM q2",
+      "depends_on": ["q1", "q2"]
+    }}
+  ],
+  "final_query_id": "q3"
+}}
+
+IMPORTANT:
+- Use ONLY double quotes for JSON strings
+- Use ONLY single quotes inside SQL strings
+- NO trailing commas
+- NO comments
+- NO code blocks (```json)
+- NO explanatory text
+
+QUESTION: {question}
+
+VALID JSON RESPONSE:"""
+    
+    def _parse_plan_json(self, plan_json: str) -> Dict[str, Any]:
+        """
+        Parse and validate JSON query plan from LLM.
+        
+        Args:
+            plan_json: Raw JSON string from LLM
+            
+        Returns:
+            Validated dictionary with queries and final_query_id
+            
+        Raises:
+            QueryError: If JSON is invalid or missing required fields
+        """
+        # Clean potential markdown
+        plan_json = plan_json.replace('```json', '').replace('```', '').strip()
+        
+        # Remove any text before the first {
+        json_start = plan_json.find('{')
+        if json_start > 0:
+            plan_json = plan_json[json_start:]
+        
+        # Remove any text after the last }
+        json_end = plan_json.rfind('}')
+        if json_end > 0:
+            plan_json = plan_json[:json_end + 1]
+        
+        try:
+            plan_dict = json.loads(plan_json)
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse plan JSON: {e}")
+            logger.debug(f"Raw JSON: {plan_json[:500]}")
+            raise QueryError(f"Invalid JSON in query plan: {e}")
+        
+        # Validate structure
+        if 'queries' not in plan_dict:
+            raise QueryError("Query plan missing 'queries' field")
+        
+        if 'final_query_id' not in plan_dict:
+            raise QueryError("Query plan missing 'final_query_id' field")
+        
+        if not isinstance(plan_dict['queries'], list):
+            raise QueryError("'queries' must be a list")
+        
+        if len(plan_dict['queries']) == 0:
+            raise QueryError("Query plan must have at least one query")
+        
+        # Validate each query
+        for i, query in enumerate(plan_dict['queries']):
+            required_fields = ['id', 'description', 'sql']
+            for field in required_fields:
+                if field not in query:
+                    raise QueryError(f"Query {i} missing required field: {field}")
+            
+            # depends_on is optional, default to empty list
+            if 'depends_on' not in query:
+                query['depends_on'] = []
+        
+        return plan_dict
+    
+    def _build_query_plan(self, plan_dict: Dict[str, Any], question: str) -> QueryPlan:
+        """
+        Build QueryPlan object from validated dictionary.
+        
+        Args:
+            plan_dict: Validated plan dictionary
+            question: Original question
+            
+        Returns:
+            QueryPlan object ready for execution
+        """
+        query_steps = []
+        
+        for query_data in plan_dict['queries']:
+            # Clean the SQL
+            sql = self._clean_sql(query_data['sql'])
+            
+            step = QueryStep(
+                id=query_data['id'],
+                description=query_data['description'],
+                sql=sql,
+                depends_on=query_data.get('depends_on', [])
+            )
+            query_steps.append(step)
+        
+        plan = QueryPlan(
+            queries=query_steps,
+            final_query_id=plan_dict['final_query_id'],
+            question=question
+        )
+        
+        return plan
