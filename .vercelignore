@@ -1,5 +1,15 @@
 # Vercel ignore patterns
-# Exclude these from deployment to reduce bundle size
+# Frontend-only deployment - exclude backend and data files
+
+# Exclude entire backend
+api/
+src/
+requirements.txt
+runtime.txt
+Makefile
+
+# Exclude all data files (too large for serverless)
+data/
 
 # Python cache
 __pycache__/
@@ -11,6 +21,7 @@ __pycache__/
 env/
 venv/
 ENV/
+.venv/
 
 # IDE
 .vscode/
